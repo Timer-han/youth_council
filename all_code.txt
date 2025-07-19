@@ -1,0 +1,208 @@
+Структура проекта
+tatar_youth_bot/
+├── docker-compose.yml
+├── Dockerfile
+├── requirements.txt
+├── .env.example
+├── .gitignore
+├── README.md
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── config.py
+│   ├── database/
+│   │   ├── __init__.py
+│   │   ├── models.py
+│   │   └── database.py
+│   ├── handlers/
+│   │   ├── __init__.py
+│   │   ├── user_handlers.py
+│   │   └── admin_handlers.py
+│   ├── keyboards/
+│   │   ├── __init__.py
+│   │   ├── user_keyboards.py
+│   │   └── admin_keyboards.py
+│   ├── middlewares/
+│   │   ├── __init__.py
+│   │   └── auth_middleware.py
+│   └── utils/
+│       ├── __init__.py
+│       ├── admin_utils.py
+│       └── pagination.py
+└── data/
+    └── database.db  # будет создана автоматически
+Основные файлы проекта
+docker-compose.yml
+yamlversion: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: tatar_youth_bot
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+    depends_on:
+      - db
+
+  db:
+    image: postgres:15-alpine
+    container_name: tatar_youth_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tatar_youth
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+volumes:
+  postgres_data:
+Dockerfile
+dockerfileFROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app/ ./app/
+COPY data/ ./data/
+
+CMD ["python", "-m", "app.main"]
+requirements.txt
+aiogram==3.4.1
+aiosqlite==0.19.0
+sqlalchemy==2.0.25
+alembic==1.13.1
+python-dotenv==1.0.0
+asyncpg==0.29.0
+pillow==10.2.0
+.env.example
+BOT_TOKEN=your_bot_token_here
+ADMIN_IDS=123456789,987654321
+DATABASE_URL=postgresql://postgres:postgres@db:5432/tatar_youth
+app/config.py
+pythonimport os
+from typing import List
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS: List[int] = [int(id_) for id_ in os.getenv("ADMIN_IDS", "").split(",") if id_.strip()]
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./data/database.db")
+
+# Настройки пагинации
+EVENTS_PER_PAGE = 5
+PARTICIPANTS_PER_PAGE = 10
+app/database/models.py
+pythonfrom sqlalchemy import Column, Integer, String, Text, DateTime, Boolean, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship
+from datetime import datetime
+
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(Integer, unique=True, nullable=False)
+    username = Column(String(255))
+    first_name = Column(String(255))
+    last_name = Column(String(255))
+    phone = Column(String(20))
+    is_admin = Column(Boolean, default=False)
+    is_moderator = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Event(Base):
+    __tablename__ = "events"
+    
+    id = Column(Integer, primary_key=True)
+    title = Column(String(255), nullable=False)
+    short_description = Column(Text)
+    full_description = Column(Text)
+    date = Column(DateTime, nullable=False)
+    location = Column(String(255))
+    speakers = Column(Text)  # JSON string
+    image_path = Column(String(255))
+    registration_required = Column(Boolean, default=True)
+    max_participants = Column(Integer)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    registrations = relationship("Registration", back_populates="event")
+
+class Registration(Base):
+    __tablename__ = "registrations"
+    
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    event_id = Column(Integer, ForeignKey("events.id"))
+    registered_at = Column(DateTime, default=datetime.utcnow)
+    
+    user = relationship("User")
+    event = relationship("Event", back_populates="registrations")
+app/database/database.py
+pythonfrom sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from app.config import DATABASE_URL
+from app.database.models import Base
+
+engine = create_async_engine(DATABASE_URL, echo=True)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+app/main.py
+pythonimport asyncio
+import logging
+from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
+
+from app.config import BOT_TOKEN
+from app.database.database import init_db
+from app.handlers.user_handlers import user_router
+from app.handlers.admin_handlers import admin_router
+from app.middlewares.auth_middleware import AuthMiddleware
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+async def main():
+    # Инициализация бота и диспетчера
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    
+    # Инициализация базы данных
+    await init_db()
+    
+    # Подключение middleware
+    dp.message.middleware(AuthMiddleware())
+    dp.callback_query.middleware(AuthMiddleware())
+    
+    # Подключение роутеров
+    dp.include_router(user_router)
+    dp.include_router(admin_router)
+    
+    # Запуск бота
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
